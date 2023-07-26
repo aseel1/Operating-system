@@ -1,1 +1,286 @@
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <limits.h>
+#include "concurrent_list.h"
+
+//in hand over hand teq we lock first node and its next,then adjust pointers accordingly as func require and then unlock first and lock next(mean each iteration we have 2 locks at hand) 
+struct node {                                // node struct that have value, lock to each node and next.ptr
+    int value;
+    node* next;
+    pthread_mutex_t lock;
+};
+
+struct list {                                //list struct that have a ptr to list head, and lock to list
+    node* head;
+    pthread_mutex_t lock;                    
+};
+
+void delete_node(node* node)                 //a function that delete the node,destroy its lock and free it
+{
+    pthread_mutex_destroy(&(node->lock));
+    free(node);
+}
+node* create_node(int value)                 // a func' that create a node with its given value and points its next to null
+{
+    node* nod = (node*)malloc(sizeof(node)) ;//allocating new node
+    if (!nod) {                              //if malloc failed
+        exit(1);
+    }
+    nod->value = value;                      //setting the node value to value and next null
+    nod->next = NULL;
+
+    if (pthread_mutex_init(&(nod->lock), NULL) != 0)//init the lock and check if it worked
+    {
+
+        free(nod);
+        exit(1);
+    }
+   
+    return nod;
+}
+
+void print_node(node* node) {
+    if (node) {
+        printf("%d ", node->value);
+    }
+}
+
+list* create_list() {
+    list* new_list = (list*)malloc(sizeof(list));        // allocate memory for list
+    if (new_list == NULL)                                // if fails return
+        exit(1);
+
+    new_list->head = NULL;                               // list head node null
+    if (pthread_mutex_init(&(new_list->lock), NULL) != 0)//init list lock and check if it worked
+    {
+
+        free(new_list);
+        exit(1);
+    }
+    return new_list;
+}
+
+void delete_list(list* list) 
+{
+    if (!list) return;                              //if no list, we don't need to do anyting
+    pthread_mutex_lock(&(list->lock));              //getting the list head
+    node* head = list->head;                        //ptr to head
+    pthread_mutex_unlock(&(list->lock));            //release lock 
+    if (!head)                                      //if head null,  destroy the list  and free the list
+    {
+        pthread_mutex_destroy(&(list->lock));
+        free(list);
+        return;
+    }
+
+    pthread_mutex_lock(&(head->lock));              //lock head node
+    while (head->next)                              //while there is next to the list ,(we use hand over hand teq now)
+    {
+        pthread_mutex_lock(&(head->next->lock));    //we lock it next 
+        node* next = head->next;
+        pthread_mutex_unlock(&(head->lock));
+        delete_node(head);                          //delete the list current head
+        head = next;                                //set head to its next
+
+    }
+    pthread_mutex_unlock(&(head->lock));
+    delete_node(head);                              //delete the last node on the list
+    pthread_mutex_destroy(&(list->lock));           //destroy the list lock and free it
+    free(list);
+
+
+
+}
+
+void insert_value(list* list, int value) {
+    if (!list)  return;                                     //if no list just return
+
+    pthread_mutex_lock(&(list->lock));                      //lock list to get head ptr
+    if (!(list->head))                                      //first case list is empty 
+    {
+        list->head = create_node(value);                    //make new node with val
+        pthread_mutex_unlock(&(list->lock));                //unlock lock on list
+
+    }
+    else                                                    //list aint empty 
+    {
+        node* ptr = list->head;                             //get list head ptr
+        pthread_mutex_unlock(&(list->lock));                //unlock list lock
+        pthread_mutex_lock(&(ptr->lock));                   //now we will lock the head mutex
+        if (value <= ptr->value)
+        {                                                   // if node need to be putten first
+            node* newNode = create_node(value);             //create newnode
+            pthread_mutex_lock(&(newNode->lock));           // lock newNode
+            newNode->next = ptr;
+            list->head = newNode;
+            pthread_mutex_unlock(&(ptr->lock));             //unlock lockes
+            pthread_mutex_unlock(&(newNode->lock));
+        }
+        else
+        {
+            node* pre = NULL;
+
+            while ((ptr->next) && (ptr->next->value <= value))  // run to find right place to insert using hand over hand locking
+            {
+                pthread_mutex_lock(&(ptr->next->lock));         //lock the next element on the list
+                pre = ptr;                                      // make pre ptr to unlock later
+                ptr = ptr->next;                                //assign ptr to it's next ptr
+                pthread_mutex_unlock(&(pre->lock));             //unlock the lock of pre
+            }
+            node* newNode = create_node(value);                 //create new node with the value "value"
+            pthread_mutex_lock(&(newNode->lock));               // lock newNode
+            if (ptr->next == NULL)                              //if next is null means we need to put node last  
+            {
+
+                ptr->next = newNode;
+                pthread_mutex_unlock(&(ptr->lock));             //unlock last lock
+                pthread_mutex_unlock(&(newNode->lock));
+               
+            }
+            else
+            {
+                // node need bettwen 2 nodes when ptr points at node before inserting
+
+                pthread_mutex_lock(&(ptr->next->lock));
+                newNode->next = ptr->next;
+                ptr->next = newNode;
+                pthread_mutex_unlock(&(newNode->next->lock));       // unlock lock
+                pthread_mutex_unlock(&(ptr->lock));             //unlock  lock
+                pthread_mutex_unlock(&(newNode->lock));
+                  
+            }
+        }
+
+
+    }
+}
+
+
+void remove_value(list* list, int value) {
+    if (!list)     return;                                  //if no list return...
+
+    pthread_mutex_lock(&(list->lock));                      //lock list to get head first
+    if (!(list->head))  pthread_mutex_unlock(&(list->lock));// if list got no nodes unlock and do nothing
+
+    else {
+        node* head = list->head;                            //get the head of the list
+        pthread_mutex_unlock(&(list->lock));                //unlock the list lock
+        pthread_mutex_lock(&(head->lock));                  //lock the list head mutex
+        if (head->value == value)                           //if we need to remove head 
+        {
+            if (head->next != NULL)   pthread_mutex_lock(&(head->next->lock));
+            list->head = head->next;
+            pthread_mutex_unlock(&(head->lock));
+            delete_node(head);                              //delete node
+            if (list->head != NULL)  pthread_mutex_unlock(&(list->head->lock));//unlock node(new first)
+            return;
+        }
+        while ((head->next) && (head->next->value != value)) //loop that stops 1 node before target value(removal)
+        {
+            pthread_mutex_lock(&(head->next->lock));        //lock the next element on the list
+            node* pre = head;
+            head = head->next;                              //assign head->next to be the new head
+            pthread_mutex_unlock(&(pre->lock));             //unlock the mutex of the head from the beginning of the loop
+        }
+        if (head->next == NULL) {                           //if it came to last node it means value not found,release locks 
+            pthread_mutex_unlock(&(head->lock));
+            return;
+        }
+        if ((head->next->next == NULL) && head->next->value == value)// remove last node case
+        {
+            
+            delete_node(head->next);
+            head->next = NULL;
+            pthread_mutex_unlock(&(head->lock));
+        }
+        else
+        {                                                   //the node we need to remove is somewhere in the middle of the list(head->next)
+            pthread_mutex_lock(&(head->next->lock));        //lock its next mutex
+            pthread_mutex_lock(&(head->next->next->lock));
+            node* toRemove = head->next;                    //toRemove is the head->next
+            head->next = toRemove->next;
+            pthread_mutex_unlock(&(toRemove->lock));
+            delete_node(toRemove);//delete toRemove
+            pthread_mutex_unlock(&(head->lock));
+            pthread_mutex_unlock(&(head->next->lock));
+        }
+    }
+
+}
+
+void print_list(list* list)
+{
+    
+    if (list == NULL)                           //if no list case
+    {
+        printf("\n");
+        return;
+    }                                         
+    if (list->head == NULL)                     //if the list got no nodes case
+    {
+        printf("\n");
+        return;
+    }
+   
+    pthread_mutex_lock(&(list->lock));          //lock list till we get its list head 
+    node* ptr = list->head;                     //get list head
+    pthread_mutex_unlock(&(list->lock));        //unlock list 
+
+    node* next = NULL;
+    pthread_mutex_lock(&(ptr->lock));
+    while (ptr != NULL) {                       // now we use handoverhand teq to print values
+        print_node(ptr);
+        next = ptr->next;
+        if (next != NULL)
+        {
+            pthread_mutex_lock(&(next->lock));
+        }
+        pthread_mutex_unlock(&(ptr->lock));
+        ptr = next;
+    }
+
+    printf("\n"); // DO NOT DELETE
+    return;
+}
+
+void count_list(list* list, int (*predicate)(int)) {
+    int count = 0;
+    
+    if (list == NULL)                           //if no list case
+    {
+        printf("%d items were counted\n", count);
+        return;
+    }
+    if (list->head == NULL)                     //if the list got no nodes case
+    {
+        printf("%d items were counted\n", count);
+        return;
+    }
+
+
+
+    pthread_mutex_lock(&(list->head->lock));                                        //lock to get list head
+    node* current = list->head;                                                     //get list head
+    pthread_mutex_unlock(&(list->head->lock));                                      //unlock lock
+
+    if (current != NULL) pthread_mutex_lock(&(current->lock));                      //lock node 
+    node* pre = NULL;
+    while (current != NULL) {                                                       //now we use the hand over hand teq to iterate list and print if greater
+
+
+        if (predicate(current->value)) 
+            count++;
+ 
+        if (current->next != NULL)   pthread_mutex_lock(&(current->next->lock));
+        pre = current;
+        current = current->next;
+        pthread_mutex_unlock(&(pre->lock));
+
+    }
+    printf("%d items were counted\n", count);
+}
+
+
+
 
