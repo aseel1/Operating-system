@@ -1,0 +1,329 @@
+#include <linux/ctype.h>
+#include <linux/config.h>
+#include <linux/module.h>
+#include <linux/kernel.h>  	
+#include <linux/slab.h>
+#include <linux/fs.h>       		
+#include <linux/errno.h>  
+#include <linux/types.h> 
+#include <linux/proc_fs.h>
+#include <linux/fcntl.h>
+#include <asm/system.h>
+#include <asm/uaccess.h>
+#include <linux/string.h>
+
+#include "encdec.h"
+
+#define MODULE_NAME "encdec"
+
+
+
+
+char* caesar_buffer;
+char* xor_buffer;
+
+void zero_buffer(char* buffer, int length)								//helper function that 0's the buffer
+{
+	memset(buffer, 0, length);
+}
+
+
+
+
+void caesar_decrypt(char* buf, unsigned char key, int count) {		   //function caesar_decrypt, take buffer, encryption key, and number of characters to decrypt and decrypt it using caesar cipher.
+	int i;
+	for (i = 0; i < count; i++) {
+		buf[i] = ((buf[i] - key) + 128) % 128;
+	}
+}
+
+void caesar_encrypt(char* buf, unsigned char key, int count) {          //function caesar_encrypt, take buffer, encryption key, and number of characters to encrypt and encrypt it using caesar cipher.
+	int i;
+	for (i = 0; i < count; i++)
+	{
+		buf[i] = (buf[i] + key) % 128;
+	}
+}
+
+void xor_encrypt(char* buf, unsigned char key, int count) {              //function xor_crypt, take buffer, encryption key, and number of characters to crypt and crypt it using xor cipher.(since xor cipher works in the exact same way for encryption and decryption, it is the same function for both)
+	int i;
+	for (i = 0; i < count; i++) {
+		buf[i] = buf[i] ^ key;
+	}
+}
+
+
+
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ASEEL_ASSAL");
+
+int 	encdec_open(struct inode* inode, struct file* filp);
+int 	encdec_release(struct inode* inode, struct file* filp);
+int 	encdec_ioctl(struct inode* inode, struct file* filp, unsigned int cmd, unsigned long arg);
+
+ssize_t encdec_read_caesar(struct file* filp, char* buf, size_t count, loff_t* f_pos);
+ssize_t encdec_write_caesar(struct file* filp, const char* buf, size_t count, loff_t* f_pos);
+
+ssize_t encdec_read_xor(struct file* filp, char* buf, size_t count, loff_t* f_pos);
+ssize_t encdec_write_xor(struct file* filp, const char* buf, size_t count, loff_t* f_pos);
+
+int memory_size = 0;
+
+MODULE_PARM(memory_size, "i");
+
+int major = 0;
+
+struct file_operations fops_caesar = {
+	.open = encdec_open,
+	.release = encdec_release,
+	.read = encdec_read_caesar,
+	.write = encdec_write_caesar,
+	.llseek = NULL,
+	.ioctl = encdec_ioctl,
+	.owner = THIS_MODULE
+};
+
+struct file_operations fops_xor = {
+	.open = encdec_open,
+	.release = encdec_release,
+	.read = encdec_read_xor,
+	.write = encdec_write_xor,
+	.llseek = NULL,
+	.ioctl = encdec_ioctl,
+	.owner = THIS_MODULE
+};
+
+// Implemetation suggestion:
+// -------------------------
+// Use this structure as your file-object's private data structure
+typedef struct {
+	unsigned char key;
+	int read_state;
+} encdec_private_data;
+
+int init_module(void)
+{
+	major = register_chrdev(major, MODULE_NAME, &fops_caesar);							//this is the assigment of our driver
+	if (major < 0)
+	{
+		return major;
+	}
+	caesar_buffer = kmalloc(memory_size, GFP_KERNEL);									//allocate space for the caesar data buffer
+	if (!caesar_buffer)  return -ENOMEM;												//if could not allocate memory, error
+
+
+	//zero_buffer(caesar_buffer, memory_size);								         	//fill the buffer with 0.
+
+	xor_buffer = kmalloc(memory_size, GFP_KERNEL);										//allocate space for the caesar data buffer
+	if (!xor_buffer)  return -ENOMEM;
+
+	//zero_buffer(xor_buffer, memory_size);												//fill the buffer with 0.
+	return 0;
+
+
+}
+
+void cleanup_module(void)
+{
+	unregister_chrdev(major, MODULE_NAME);											    // unregister the driver from the chrdev data base
+	if (caesar_buffer)															        // and free space from both buffers
+		kfree(caesar_buffer);
+	if (xor_buffer)
+		kfree(xor_buffer);
+}
+
+int encdec_open(struct inode* inode, struct file* filp)
+{
+	/*if (!filp || !inode)
+	{
+		return -1;
+	}*/
+	int minor = MINOR(inode->i_rdev);
+
+	if (minor == 0)																		 // first we adjust the filp to its right operation using it minor
+		filp->f_op = &fops_caesar;
+	else
+		filp->f_op = &fops_xor;
+
+
+	filp->private_data = kmalloc(sizeof(encdec_private_data), GFP_KERNEL);				 // allocate memory for the private data
+	if (!filp->private_data)															 // if allocation failed
+		return -ENOMEM;
+
+	encdec_private_data* dev_private_data = (encdec_private_data*)filp->private_data;
+	dev_private_data->read_state = ENCDEC_READ_STATE_DECRYPT;
+	dev_private_data->key = 0;
+
+	return 0;
+}
+
+
+int encdec_release(struct inode* inode, struct file* filp)								 //realease moudle data
+{
+
+	if (filp->private_data)
+	{ //check if not NUll then free data
+		kfree(filp->private_data);
+	}
+
+	return 0;
+}
+
+int encdec_ioctl(struct inode* inode, struct file* filp, unsigned int cmd, unsigned long arg)
+{
+	//if (filp->private_data)																 // if theres a private data
+	//{
+	switch (cmd) {
+	case ENCDEC_CMD_CHANGE_KEY:												 				 //if we need to change encryption key
+		((encdec_private_data*)(filp->private_data))->key = (unsigned char)arg;				 //set new key
+		break;
+	case ENCDEC_CMD_SET_READ_STATE:															 //if we need to change read state
+		((encdec_private_data*)(filp->private_data))->read_state = (int)arg;				 //set the read state
+		break;
+	case ENCDEC_CMD_ZERO:																	 //if we need to zero the data buffer
+		if (MINOR(inode->i_rdev) == 0) 														 //we check in wich device we working on and 0's accordingly
+			zero_buffer(caesar_buffer, memory_size);
+
+		else
+			zero_buffer(xor_buffer, memory_size);
+
+		break;
+	}
+	
+	return 0;
+}
+
+
+
+
+	ssize_t encdec_write_caesar(struct file* filp, const char* buf, size_t count, loff_t * f_pos)
+	{
+
+		if (*f_pos >= memory_size) {
+			return -ENOSPC;										                        //if the buffer is full return error
+		}
+		if (filp->private_data)														    // if not null
+		{
+			while (((*f_pos) + count) > memory_size && count > 0)					        //set count to amount we can read.
+				count--;
+
+			if (copy_from_user(caesar_buffer + (*f_pos), buf, count))
+				return -EFAULT;//write to the device
+			caesar_encrypt(caesar_buffer + (*f_pos), (int)((encdec_private_data*)(filp->private_data))->key, count);//encrypt what we just wrote
+			(*f_pos) += count;															//increase buff size
+			return count;
+
+		}//return number of charachters we inserted
+		else
+			return -ENOSPC;
+
+	}
+
+
+	ssize_t encdec_write_xor(struct file* filp, const char* buf, size_t count, loff_t * f_pos)
+	{
+		if (*f_pos >= memory_size)	return -ENOSPC;										 //if the buffer is full return error
+
+
+		if (filp->private_data)													       	 // if not null
+		{
+			while (((*f_pos) + count) > memory_size && count > 0)						 //set count to amount we can read.
+				count--;
+
+
+			if (((*f_pos) + count) > memory_size) {//if we still can't read, error
+				return -ENOSPC;
+			}
+
+			if (copy_from_user(xor_buffer + (*f_pos), buf, count))
+				return -EFAULT;//write to the device
+			xor_encrypt(xor_buffer + (*f_pos), (int)((encdec_private_data*)(filp->private_data))->key, count);//encrypt what we just wrote
+			(*f_pos) += count;															//increase buff size
+			return count;																//return number of charachters we inserted
+		}
+		else 																			//if the device isn't opened,error
+			return -ENOSPC;
+
+	}
+	ssize_t encdec_read_caesar(struct file* filp, char* buf, size_t count, loff_t * f_pos)
+	{
+		if (*f_pos >= memory_size)														// Check if read position is beyond the memory size
+			return -EINVAL;
+
+		encdec_private_data* data = (encdec_private_data*)filp->private_data;
+
+		if (data == NULL)																// Check if private data is valid
+			return -EINVAL;
+
+
+		while ((*f_pos + count) > memory_size && count > 0)								// Adjust the count if it exceeds the remaining memory size						
+			count--;
+
+		if (count > 0)
+		{
+			if (data->read_state == ENCDEC_READ_STATE_DECRYPT)							// Check if decryption is required and if needed decrypt
+			{
+				caesar_decrypt(caesar_buffer + *f_pos, data->key, count);
+				if (copy_to_user(buf, caesar_buffer + *f_pos, count))
+				{
+					return -EFAULT;
+				}
+				caesar_encrypt(caesar_buffer + *f_pos, data->key, count);
+			}
+			else																		// encrypted mode   
+			{
+				if (copy_to_user(buf, caesar_buffer + *f_pos, count))
+				{
+					return -EFAULT;
+				}
+			}
+			*f_pos += count;															// count++ and return it
+			return count;
+		}
+		else
+		{
+			return -EINVAL;
+		}
+	}
+
+	ssize_t encdec_read_xor(struct file* filp, char* buf, size_t count, loff_t * f_pos)
+	{
+		if (*f_pos >= memory_size)														// Check if read position is beyond the memory size
+			return -EINVAL;
+
+		encdec_private_data* data = (encdec_private_data*)filp->private_data;
+
+		if (data == NULL)																// Check if private data is valid
+			return -EINVAL;
+
+		while ((*f_pos + count) > memory_size && count > 0)								// Adjust the count if it exceeds the remaining memory size
+			count--;
+
+		if (count > 0)
+		{
+			if (data->read_state == ENCDEC_READ_STATE_DECRYPT)							// Check if decryption is required and if needed decrypt
+			{
+				xor_encrypt(xor_buffer + *f_pos, data->key, count);
+				if (copy_to_user(buf, xor_buffer + *f_pos, count))
+				{
+					return -EFAULT;
+				}
+				xor_encrypt(xor_buffer + *f_pos, data->key, count);
+			}
+			else																		// encrypted mode 
+			{
+				if (copy_to_user(buf, xor_buffer + *f_pos, count))
+				{
+					return -EFAULT;
+				}
+			}
+			*f_pos += count;															//count++
+			return count;
+		}
+		else
+		{
+			return -EINVAL;
+		}
+	}
+
